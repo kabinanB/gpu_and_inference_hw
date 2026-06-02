@@ -120,40 +120,46 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # Why does performance rise as arithmetic intensity increases even though the
 # measured runtime changes only a little?
 #
-# A1. As arithmetic intensity increases, the operations remain memory-bound (left of
-# the ridge point). The kernel runtime stays roughly constant because we're still
-# limited by memory bandwidth. However, since we're computing 2*num_ops FLOPs per
-# element, the total FLOP count increases linearly with num_ops. Therefore,
-# achieved FLOP/s = total_flops / constant_runtime increases proportionally, even
-# though wall-clock time doesn't change much.
+# A1. From the actual data: compiled ops 1-64 have AI ranging from 0.25 to 16
+# FLOP/B, runtimes stay nearly constant (~0.214ms), but achieved FLOP/s scales
+# from ~616 GFLOP/s to ~40 TFLOP/s. This is because we're memory-bandwidth
+# limited throughout this range (left of the ridge point at ~20 FLOP/B). The
+# kernel hits the 3.35 TB/s memory ceiling each time, so runtime stays constant
+# as we add more work-per-byte. The achieved FLOP/s increases simply because
+# we compute more FLOPs in the same wall time.
 #
 # Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
 # `128 ops` compiled element-wise operation. Give one or two reasons why that can
 # happen on a large GPU like an H100.
 #
-# A2. (1) Matrix multiply has high arithmetic intensity but may not achieve perfect
-# GPU utilization due to synchronization overhead and memory access patterns that
-# don't saturate all SMs equally. (2) The simple element-wise operation with high
-# arithmetic intensity can be fully fused into a single kernel with minimal overhead,
-# allowing better compute unit utilization and thus higher achieved FLOP/s.
+# A2. From data: 1024x1024 matmul achieved 31.9 TFLOP/s while 128 ops compiled
+# achieved 52.9 TFLOP/s. Two reasons: (1) Matmul has higher arithmetic intensity
+# (170.7) so it's compute-bound, but the problem size is moderate and can't fully
+# saturate H100's 67 TFLOP/s peak. (2) The fused element-wise operation is a
+# single optimally-compiled kernel with zero overhead, while matmul may have
+# suboptimal kernel selection or memory layout for this moderate size. Smaller
+# matmuls often have poor FLOP/s utilization.
 #
 # Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
 # did for smaller operations. What does that suggest about what resource is
 # becoming the bottleneck?
 #
-# A3. This suggests we're crossing the ridge point and transitioning from
-# memory-bound to compute-bound. For ops < 64, runtime is dominated by memory
-# bandwidth saturation, so adding ops doesn't increase runtime much. Around 64-128
-# ops, we reach the ridge point. Beyond that, we become compute-bound, so each
-# additional FLOP directly increases runtime since we're limited by the GPU's
-# compute throughput, not memory bandwidth.
+# A3. From data: 64 ops runs in 0.214ms (AI=16) but 128 ops runs in 0.325ms
+# (AI=32), a 52% increase. The ridge point is ~20 FLOP/B. At 64 ops we're still
+# memory-bound; at 128 ops we've crossed into the compute-bound regime. Once
+# compute becomes the bottleneck (right of ridge), adding more FLOPs directly
+# increases runtime since we can't exceed 67 TFLOP/s compute throughput. The
+# runtime increase reflects the transition from being bandwidth-limited to
+# compute-limited.
 #
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
 #
-# A4. Eager PyTorch launches separate GPU kernels for each operation (multiply, add)
-# in each iteration, materializing intermediate tensors to global memory. This
-# increases total bytes moved dramatically compared to the fused model. The compiled
-# version fuses the entire loop into a single kernel, keeping intermediates in
-# registers, resulting in much higher arithmetic intensity. This is why the eager
-# points stay left on the roofline (memory-bound) while compiled points move
-# rightward with increasing arithmetic intensity.
+# A4. From the plot: eager ops (orange) stay horizontal with low AI (~0.12-0.25)
+# and runtimes grow linearly (0.62ms to 67ms), while compiled ops (blue) move
+# rightward (AI 0.25-32) with nearly constant runtime (~0.214ms). Eager PyTorch
+# launches separate kernels for each operation in each iteration, materializing
+# all intermediate tensors. For `acc = acc * x + x` with num_ops iterations, eager
+# performs ~(2*num_ops + 2) reads/writes per element vs. compiled's 2 reads/1 write.
+# This crushes the arithmetic intensity, keeping eager operations memory-bound no
+# matter how many ops, and making runtime grow linearly with num_ops. Fusion is
+# the key difference.
